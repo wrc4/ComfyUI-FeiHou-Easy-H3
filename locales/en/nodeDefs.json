@@ -42,6 +42,19 @@
       "0": { "name": "H3 model bundle" }
     }
   },
+  "FeiHouEasyH3ModelBundleBuilder": {
+    "display_name": "FeiHou Easy H3 Model Bundle Builder",
+    "description": "Build an H3 bundle from native ComfyUI MODEL, CLIP, and VAE connections.",
+    "inputs": {
+      "model": { "name": "Model" },
+      "clip": { "name": "CLIP / text encoder" },
+      "video_vae": { "name": "Video VAE" },
+      "audio_vae": { "name": "Audio VAE" }
+    },
+    "outputs": {
+      "0": { "name": "H3 model bundle" }
+    }
+  },
   "FeiHouEasyH3": {
     "display_name": "ComfyUI-FeiHou-Easy-H3",
     "description": "MiniMax H3 generation with an embedded 9-image, 3-video, and 3-audio media gallery.",

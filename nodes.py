@@ -2237,6 +2237,54 @@ class FeiHouEasyH3ModelAdapter:
         ),)
 
 
+class FeiHouEasyH3ModelBundleBuilder:
+    """Build an H3 bundle from native ComfyUI model-loading nodes.
+
+    The single ``model`` input is used for both FL2VA and REF2VA so the user
+    can switch generation modes without a second model node.  If separate
+    FL2VA/REF2VA models are needed later, they can be added as optional
+    inputs without changing existing workflows.
+    """
+
+    CATEGORY = "FeiHou Easy H3"
+    FUNCTION = "build"
+    RETURN_TYPES = ("MINIMAX_H3_BUNDLE",)
+    RETURN_NAMES = ("h3_bundle",)
+    DESCRIPTION = "Build a MiniMax H3 bundle from native ComfyUI MODEL, CLIP and VAE connections."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "video_vae": ("VAE",),
+                "audio_vae": ("VAE",),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @staticmethod
+    def build(model, clip, video_vae, audio_vae):
+        if model is None:
+            raise ValueError("Connect a native MiniMax H3 MODEL input.")
+        return (MiniMaxH3Bundle(
+            fl2va_model_name=NONE_MODEL,
+            ref2va_model_name=NONE_MODEL,
+            clip_name="connected",
+            video_vae_name="connected",
+            audio_vae_name="connected",
+            clip=clip,
+            video_vae=video_vae,
+            audio_vae=audio_vae,
+            fl2va_model_obj=model,
+            ref2va_model_obj=model,
+        ),)
+
+
 def _infer_media_type(value: Any) -> str:
     if value is None:
         return ""
@@ -2695,6 +2743,7 @@ NODE_CLASS_MAPPINGS = {
     "FeiHouEasyH3LoraStack": FeiHouEasyH3LoraStack,
     "FeiHouEasyH3Loader": FeiHouEasyH3Loader,
     "FeiHouEasyH3ModelAdapter": FeiHouEasyH3ModelAdapter,
+    "FeiHouEasyH3ModelBundleBuilder": FeiHouEasyH3ModelBundleBuilder,
     "FeiHouEasyH3": FeiHouEasyH3,
     "FeiHouEasyH3Output": FeiHouEasyH3Output,
     "FeiHouEasyH3PromptPreview": FeiHouEasyH3PromptPreview,

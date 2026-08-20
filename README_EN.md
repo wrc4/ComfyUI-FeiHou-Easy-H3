@@ -27,6 +27,7 @@ Nodes appear under `FeiHou Easy H3`:
 
 - `加载LoRA（旁路，仅模型）（用于调试）` (the same native canvas stack UI as `FeiHou LoRA Stack (Merge/Extract)`)
 - `FeiHou Easy H3 Loader`
+- `FeiHou Easy H3 Model Bundle Builder` (assembles a bundle from native `MODEL`, `CLIP`, video VAE and audio VAE connections, for use with ComfyUI native loaders and UniBlockSwap)
 - `ComfyUI-FeiHou-Easy-H3`
 - `FeiHou Easy H3 Model Adapter`
 - `FeiHou Easy H3 Output`

@@ -42,6 +42,19 @@
       "0": { "name": "H3 模型组合" }
     }
   },
+  "FeiHouEasyH3ModelBundleBuilder": {
+    "display_name": "FeiHou Easy H3 模型组合构建器",
+    "description": "从 ComfyUI 原生 MODEL、CLIP 与 VAE 连接构建 H3 模型组合。",
+    "inputs": {
+      "model": { "name": "模型" },
+      "clip": { "name": "CLIP / 文本编码器" },
+      "video_vae": { "name": "视频 VAE" },
+      "audio_vae": { "name": "音频 VAE" }
+    },
+    "outputs": {
+      "0": { "name": "H3 模型组合" }
+    }
+  },
   "FeiHouEasyH3": {
     "display_name": "ComfyUI-FeiHou-Easy-H3",
     "description": "内嵌 9 张图片、3 个视频、3 个音频媒体栏的 MiniMax H3 生成节点。",

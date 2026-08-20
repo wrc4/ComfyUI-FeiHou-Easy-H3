@@ -22,6 +22,7 @@
 
 - `加载LoRA（旁路，仅模型）（用于调试）`：完全沿用 `FeiHou LoRA Stack (Merge/Extract)` 的原生画布堆栈样式，可动态添加、启停、排序多个 LoRA；
 - `FeiHou Easy H3 Loader`：从左侧接收 LoRA 堆栈，并在内部加载 FL2VA/REF2VA 模型和应用 LoRA，同时加载文本编码器、视频 VAE 和音频 VAE；
+- `FeiHou Easy H3 Model Bundle Builder`：接收 ComfyUI 原生 `MODEL`、`CLIP`、视频 VAE 与音频 VAE，组装成 H3 模型组合；适合配合 `UNETLoader`、`CLIPLoader`、`VAELoader` 以及 UniBlockSwap 等原生节点使用；
 - `ComfyUI-FeiHou-Easy-H3`：主生成节点及内嵌媒体面板；
 - `FeiHou Easy H3 Model Adapter`：接入外部标准 ComfyUI 模型加载链；
 - `FeiHou Easy H3 Output`：拆出 Conditioning、Latent、视频 VAE、音频 VAE、FPS 和最终提示词；
