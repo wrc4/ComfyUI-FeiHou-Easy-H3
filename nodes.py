@@ -9,6 +9,7 @@ node; the browser extension sends their input-folder paths to this backend.
 from __future__ import annotations
 
 import io
+import ipaddress
 import inspect
 import logging
 import math
@@ -47,9 +48,13 @@ from comfy_api.latest import InputImpl
 
 MODE_IMAGE = "image"
 MODE_REFERENCE = "reference"
+H3_DURATION_CONTROL_TYPE = "FEIHOU_H3_DURATION_CONTROL"
 KEYFRAME_FIRST = "first"
 KEYFRAME_LAST = "last"
-REFERENCE_SHORT_EDGES = ("480", "544", "640", "736", "768", "832", "928", "1024", "1088")
+# ``match`` intentionally mirrors the official MiniMaxH3ReferenceToVideo
+# behaviour: scale to the generation pixel area, down only.  The numeric
+# values remain explicit short-edge caps for users who need fixed fidelity.
+REFERENCE_SHORT_EDGES = ("match", "480", "544", "640", "736", "768", "832", "928", "1024", "1088")
 REF_IMAGE_DEFAULT = "480"
 REFERENCE_MENTION_FILENAME = "filename"
 REFERENCE_MENTION_INDEX = "index"
@@ -116,6 +121,15 @@ PROMPT_OPTIMIZER_MODEL_LIST_TIMEOUT_SECONDS = 20
 PROMPT_OPTIMIZER_JPEG_QUALITY = 85
 PROMPT_OPTIMIZER_VIDEO_SAMPLE_COUNT = 3
 PROMPT_OPTIMIZER_CONFIG_VERSION = 6
+PROMPT_OPTIMIZER_ALLOWED_HOSTS_VERSION = 1
+PROMPT_OPTIMIZER_ALLOWED_HOSTS_FILENAME = "allowed_api_hosts.json"
+PROMPT_OPTIMIZER_BUILTIN_ALLOWED_HOSTS = frozenset({
+    "open.bigmodel.cn",
+    "api.xflow.cc",
+    "dashscope.aliyuncs.com",
+    "api.deepseek.com",
+})
+PROMPT_OPTIMIZER_MAX_CUSTOM_ALLOWED_HOSTS = 100
 PROMPT_OPTIMIZER_ZHIPU_MODELS = (
     "glm-5.1", "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.7-flash",
     "glm-4.7-flashx", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.5",
@@ -485,17 +499,127 @@ def _prompt_guide_bundle(
     return "\n\n".join(blocks)
 
 
-def _prompt_optimizer_config_path() -> str:
+def _prompt_optimizer_config_directory() -> str:
     return os.path.join(
         folder_paths.get_user_directory(),
         "default",
         "ComfyUI-FeiHou-Easy-H3",
-        "prompt_optimizer.json",
     )
+
+
+def _prompt_optimizer_config_path() -> str:
+    return os.path.join(_prompt_optimizer_config_directory(), "prompt_optimizer.json")
+
+
+def _prompt_optimizer_allowed_hosts_path() -> str:
+    """A local-only allow-list that is deliberately not writable by web routes."""
+    return os.path.join(_prompt_optimizer_config_directory(), PROMPT_OPTIMIZER_ALLOWED_HOSTS_FILENAME)
 
 
 def _legacy_prompt_optimizer_config_path() -> str:
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), "prompt_optimizer.json")
+
+
+def _normalise_allowed_host(value: Any) -> str:
+    """Accept one DNS hostname, never a URL, wildcard, or IP address."""
+    host = str(value or "").strip().rstrip(".").lower()
+    if not host or any(token in host for token in ("://", "/", "\\", "@", "?", "#", ":", "*")):
+        return ""
+    try:
+        ipaddress.ip_address(host)
+        return ""
+    except ValueError:
+        pass
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if len(host) > 253 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", host):
+        return ""
+    return host
+
+
+def _read_custom_allowed_optimizer_hosts() -> set[str]:
+    """Read the user-maintained host allow-list without exposing a write route."""
+    path = _prompt_optimizer_allowed_hosts_path()
+    payload: Any = {}
+    with _PROMPT_OPTIMIZER_CONFIG_LOCK:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            # Create a discoverable, intentionally empty local file.  The web
+            # UI can explain how to add custom hosts, but cannot modify it.
+            directory = os.path.dirname(path)
+            os.makedirs(directory, exist_ok=True)
+            temporary_path = ""
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=directory,
+                    prefix=".allowed_api_hosts.", suffix=".tmp", delete=False,
+                ) as handle:
+                    temporary_path = handle.name
+                    json.dump({"version": PROMPT_OPTIMIZER_ALLOWED_HOSTS_VERSION, "hosts": []}, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                os.replace(temporary_path, path)
+            finally:
+                if temporary_path and os.path.exists(temporary_path):
+                    try:
+                        os.remove(temporary_path)
+                    except OSError:
+                        pass
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            logging.warning("Easy H3: unable to read custom API host allow-list: %s", path)
+            return set()
+
+    entries = payload.get("hosts", []) if isinstance(payload, Mapping) else []
+    hosts: set[str] = set()
+    for value in entries[:PROMPT_OPTIMIZER_MAX_CUSTOM_ALLOWED_HOSTS] if isinstance(entries, list) else []:
+        host = _normalise_allowed_host(value)
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+def _allowed_optimizer_hosts() -> set[str]:
+    return set(PROMPT_OPTIMIZER_BUILTIN_ALLOWED_HOSTS) | _read_custom_allowed_optimizer_hosts()
+
+
+def _validate_optimizer_base_url(api_url: str, api_format: str = "openai") -> str:
+    """Validate an outbound prompt-API URL before any request is created.
+
+    Custom hosts must be deliberately approved in the local allow-list file.
+    This closes the server-side request forgery path while preserving support
+    for user-selected third-party API providers.
+    """
+    base = str(api_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("Prompt optimization API URL is required")
+    if not re.match(r"^https?://", base, flags=re.I):
+        base = "https://" + base
+    try:
+        parsed = urllib.parse.urlsplit(base)
+    except ValueError as exc:
+        raise ValueError("Prompt optimization API URL is invalid") from exc
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if not host or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("Prompt optimization API URL is invalid")
+
+    normalized_format = str(api_format or "openai").strip().lower()
+    if normalized_format == "ollama":
+        if scheme not in {"http", "https"} or host not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("Ollama must use a local localhost, 127.0.0.1, or ::1 endpoint")
+        return base
+
+    if scheme != "https":
+        raise ValueError("External prompt optimization APIs must use HTTPS")
+    if host not in _allowed_optimizer_hosts():
+        raise ValueError(
+            f"API host '{host}' is not allowed. Add this hostname to "
+            f"{PROMPT_OPTIMIZER_ALLOWED_HOSTS_FILENAME} and restart ComfyUI."
+        )
+    return base
 
 
 def _safe_config_id(value: Any, prefix: str) -> str:
@@ -787,6 +911,9 @@ def _prompt_optimizer_provider_choices(settings: Mapping[str, Any] | None = None
 
 
 def _read_prompt_optimizer_config() -> dict[str, Any]:
+    # Make the documented local allow-list discoverable as soon as Easy H3
+    # reads its configuration, without exposing a web route that can edit it.
+    _read_custom_allowed_optimizer_hosts()
     path = _prompt_optimizer_config_path()
     with _PROMPT_OPTIMIZER_CONFIG_LOCK:
         try:
@@ -806,6 +933,14 @@ def _read_prompt_optimizer_config() -> dict[str, Any]:
 def _write_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     current = _read_prompt_optimizer_config()
     normalized = _normalize_prompt_optimizer_config(value, current)
+    for provider in normalized.get("providers", []):
+        if not isinstance(provider, Mapping):
+            continue
+        api_url = str(provider.get("api_url") or "").strip()
+        # A blank newly-created custom provider remains editable. It becomes
+        # usable only after it has a valid, allow-listed endpoint.
+        if api_url:
+            _validate_optimizer_base_url(api_url, str(provider.get("api_format") or "openai"))
     path = _prompt_optimizer_config_path()
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
@@ -843,13 +978,22 @@ _OPTIMIZER_GEMINI_ENDPOINT_RE = re.compile(
 )
 
 
-def _normalize_optimizer_base_url(api_url: str) -> str:
-    base = str(api_url or "").strip().rstrip("/")
-    if not base:
-        raise ValueError("Prompt optimization API URL is required")
-    if not re.match(r"^https?://", base, flags=re.I):
-        base = "https://" + base
-    return base.rstrip("/")
+class _OptimizerNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow a provider redirect to an unvalidated destination."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPTIMIZER_URL_OPENER = urllib.request.build_opener(_OptimizerNoRedirectHandler())
+
+
+def _optimizer_urlopen(request: urllib.request.Request, timeout: int):
+    return _OPTIMIZER_URL_OPENER.open(request, timeout=timeout)
+
+
+def _normalize_optimizer_base_url(api_url: str, api_format: str = "openai") -> str:
+    return _validate_optimizer_base_url(api_url, api_format).rstrip("/")
 
 
 def _optimizer_endpoint_kind(value: str) -> str:
@@ -892,7 +1036,7 @@ def _gemini_url_with_query(url: str, query: str) -> str:
 
 
 def _normalize_gemini_optimizer_url(api_url: str, model: str) -> str:
-    base = _normalize_optimizer_base_url(api_url)
+    base = _normalize_optimizer_base_url(api_url, "gemini")
     parsed = urllib.parse.urlsplit(base)
     clean = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
     lower = clean.lower()
@@ -931,7 +1075,7 @@ def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
     if api_format == "gemini":
         return _normalize_gemini_optimizer_url(api_url, model)
     if api_format == "ollama":
-        base = _normalize_optimizer_base_url(api_url)
+        base = _normalize_optimizer_base_url(api_url, "ollama")
         base = _strip_optimizer_endpoint(base)
         if base.lower().endswith("/v1"):
             base = base[:-3].rstrip("/")
@@ -940,7 +1084,7 @@ def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
         if base.lower().endswith("/api"):
             return base + "/chat"
         return base + "/api/chat"
-    base = _normalize_optimizer_base_url(api_url)
+    base = _normalize_optimizer_base_url(api_url, api_format)
     endpoint = "/v1/chat/completions"
     base_kind = _optimizer_endpoint_kind(base)
     endpoint_kind = _optimizer_endpoint_kind(endpoint)
@@ -959,7 +1103,7 @@ def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
 
 
 def _optimizer_model_list_url(api_url: str, api_format: str) -> str:
-    base = _normalize_optimizer_base_url(api_url)
+    base = _normalize_optimizer_base_url(api_url, api_format)
     base = _strip_optimizer_endpoint(base)
     if api_format == "ollama":
         if base.lower().endswith("/v1"):
@@ -984,7 +1128,7 @@ def _optimizer_available_models(provider: Mapping[str, Any]) -> list[str]:
     api_url = str(provider.get("api_url") or "").strip()
     api_key = str(provider.get("api_key") or "").strip()
     if api_format != "ollama" and not api_key:
-        raise ValueError("请先填写并保存 API Key")
+        raise ValueError("Enter and save an API key first")
 
     url = _optimizer_model_list_url(api_url, api_format)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -992,19 +1136,19 @@ def _optimizer_available_models(provider: Mapping[str, Any]) -> list[str]:
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_MODEL_LIST_TIMEOUT_SECONDS) as response:
+        with _optimizer_urlopen(request, timeout=PROMPT_OPTIMIZER_MODEL_LIST_TIMEOUT_SECONDS) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         if exc.code == 401:
-            raise RuntimeError("API Key 错误，认证失败") from exc
+            raise RuntimeError("API key authentication failed") from exc
         if exc.code == 404:
-            raise RuntimeError("Base URL 未找到模型列表接口") from exc
-        raise RuntimeError(f"模型列表接口返回 HTTP {exc.code}: {detail[:500]}") from exc
+            raise RuntimeError("The base URL does not provide a model-list endpoint") from exc
+        raise RuntimeError(f"Model-list endpoint returned HTTP {exc.code}: {detail[:500]}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接模型列表接口: {exc.reason}") from exc
+        raise RuntimeError(f"Could not connect to the model-list endpoint: {exc.reason}") from exc
     except TimeoutError as exc:
-        raise RuntimeError("获取模型列表超时") from exc
+        raise RuntimeError("Timed out while retrieving the model list") from exc
 
     raw_models: Any
     if api_format == "ollama":
@@ -1023,7 +1167,7 @@ def _optimizer_available_models(provider: Mapping[str, Any]) -> list[str]:
         if text and text not in names:
             names.append(text[:200])
     if not names:
-        raise RuntimeError("接口未返回任何可用模型")
+        raise RuntimeError("The endpoint returned no usable models")
     return names
 
 
@@ -1159,7 +1303,7 @@ def _optimizer_http_json(
         _optimizer_log_media_summary(media_parts),
     )
     try:
-        with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
+        with _optimizer_urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
             raw_response = response.read().decode("utf-8", errors="replace")
             status = getattr(response, "status", 200)
             content_type = str(response.headers.get("Content-Type") or "unknown")
@@ -1220,7 +1364,7 @@ def _optimizer_http_json(
                     _redact_optimizer_log_text(raw_response),
                 )
                 raise RuntimeError(
-                    f"提示词优化接口返回非 JSON 内容（HTTP {status}，{content_type}）：{preview}"
+                    f"Prompt optimization API returned non-JSON content (HTTP {status}, {content_type}): {preview}"
                 ) from exc
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -1308,7 +1452,7 @@ def _optimizer_reference_short_edge(value: Any) -> int:
         short_edge = int(str(value or REF_IMAGE_DEFAULT))
     except (TypeError, ValueError):
         short_edge = legacy_short_edges.get(str(value or "").strip().lower(), int(REF_IMAGE_DEFAULT))
-    allowed = tuple(int(item) for item in REFERENCE_SHORT_EDGES)
+    allowed = tuple(int(item) for item in REFERENCE_SHORT_EDGES if str(item).isdigit())
     return short_edge if short_edge in allowed else min(allowed, key=lambda item: abs(item - short_edge))
 
 
@@ -1518,13 +1662,13 @@ def _run_configured_prompt_optimizer(
     config = settings if isinstance(settings, Mapping) else _read_prompt_optimizer_config()
     provider = _active_optimizer_provider(config, service_model)
     if not provider:
-        raise ValueError("提示词优化服务未启用或已不存在")
+        raise ValueError("The selected prompt optimization service is disabled or no longer exists")
 
     api_key = str(provider.get("api_key") or "")
     api_url = str(provider.get("api_url") or "")
     api_format = str(provider.get("api_format") or "openai").lower()
     if api_format not in {"openai", "gemini", "ollama"}:
-        raise ValueError("不支持当前 API 格式")
+        raise ValueError("The selected API format is not supported")
 
     raw_counts = media_counts if isinstance(media_counts, Mapping) else {}
     counts = {
@@ -1537,7 +1681,7 @@ def _run_configured_prompt_optimizer(
     requested_model = str(provider.get("_requested_model") or "").strip()
     configured_models = [*llm_models, *[name for name in vlm_models if name not in llm_models]]
     if requested_model and requested_model not in configured_models:
-        raise ValueError("所选模型已不在后台 API 设置中，请重新选择")
+        raise ValueError("The selected model is no longer configured in API Settings; select it again")
 
     configured_vlm = str(provider.get("vlm_model") or "").strip()
     selected_is_vlm = bool(requested_model and requested_model in vlm_models)
@@ -1550,9 +1694,9 @@ def _run_configured_prompt_optimizer(
     model = media_model if media_parts else requested_model or str(provider.get("llm_model") or "").strip()
     requires_key = api_format != "ollama"
     if not str(prompt or "").strip():
-        raise ValueError("提示词不能为空")
+        raise ValueError("Prompt cannot be empty")
     if not api_url.strip() or not model or (requires_key and not api_key.strip()):
-        raise ValueError("提示词优化 API 设置不完整")
+        raise ValueError("Prompt optimization API settings are incomplete")
 
     resolved_scene_guide, custom_prompt = _optimizer_scheme(config, scene_guide)
     result = _optimizer_http_json(
@@ -1618,6 +1762,39 @@ class MiniMaxH3PromptOptimizer:
         return (_optimizer_http_json(str(api_url), str(api_key), str(model), str(api_format or "openai"), system, str(prompt or "")),)
 
 
+def _is_loopback_web_request(request: Any) -> bool:
+    """Only permit browser-control routes from the machine running ComfyUI."""
+    peer = None
+    try:
+        transport = getattr(request, "transport", None)
+        peer = transport.get_extra_info("peername") if transport is not None else None
+    except Exception:
+        peer = None
+    candidates = []
+    if isinstance(peer, tuple) and peer:
+        candidates.append(peer[0])
+    elif isinstance(peer, str):
+        candidates.append(peer)
+    remote = getattr(request, "remote", None)
+    if remote:
+        candidates.append(remote)
+    for candidate in candidates:
+        host = str(candidate or "").split("%", 1)[0]
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _local_only_route_response(web: Any):
+    return web.json_response(
+        {"ok": False, "error": "This Easy H3 settings route is available only from the local ComfyUI host."},
+        status=403,
+    )
+
+
 def _register_prompt_optimizer_route() -> bool:
     try:
         from aiohttp import web
@@ -1630,10 +1807,14 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.get("/feihou_easy_h3/prompt_optimizer_settings")
     async def _prompt_optimizer_settings_get(request):
+        if not _is_loopback_web_request(request):
+            return _local_only_route_response(web)
         return web.json_response({"ok": True, "settings": _public_prompt_optimizer_config(_read_prompt_optimizer_config())})
 
     @routes.post("/feihou_easy_h3/prompt_optimizer_settings")
     async def _prompt_optimizer_settings_post(request):
+        if not _is_loopback_web_request(request):
+            return _local_only_route_response(web)
         try:
             payload = await request.json()
             settings = _write_prompt_optimizer_config(payload if isinstance(payload, dict) else {})
@@ -1643,6 +1824,8 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.get("/feihou_easy_h3/providers/{provider_id}/models")
     async def _prompt_optimizer_provider_models(request):
+        if not _is_loopback_web_request(request):
+            return _local_only_route_response(web)
         try:
             provider_id = _safe_config_id(request.match_info.get("provider_id"), "provider")
             settings = _read_prompt_optimizer_config()
@@ -1651,7 +1834,7 @@ def _register_prompt_optimizer_route() -> bool:
                 None,
             )
             if provider is None:
-                return web.json_response({"ok": False, "error": "API 接口不存在"}, status=404)
+                return web.json_response({"ok": False, "error": "API service not found"}, status=404)
             models = await asyncio.to_thread(_optimizer_available_models, provider)
             return web.json_response({"ok": True, "models": models})
         except (ValueError, RuntimeError) as exc:
@@ -1661,6 +1844,8 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.get("/feihou_easy_h3/loras")
     async def _feihou_easy_h3_loras(request):
+        if not _is_loopback_web_request(request):
+            return _local_only_route_response(web)
         try:
             return web.json_response({"ok": True, "loras": folder_paths.get_filename_list("loras")})
         except Exception as exc:
@@ -1668,6 +1853,8 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.post("/feihou_easy_h3/prompt_optimize")
     async def _prompt_optimize(request):
+        if not _is_loopback_web_request(request):
+            return _local_only_route_response(web)
         try:
             payload = await request.json()
             prompt = str(payload.get("prompt") or "")
@@ -1802,8 +1989,8 @@ def _load_gguf_unet(model_name: str):
     loader_class = _registered_node_class("UnetLoaderGGUF", "UNETLoaderGGUF", "UnetLoaderGGUFAdvanced")
     if loader_class is None:
         raise RuntimeError(
-            "检测到 GGUF MiniMax H3 主模型，但当前 ComfyUI 未安装 GGUF 加载节点。"
-            "请安装 ComfyUI-GGUF 后重启 ComfyUI。"
+            "A GGUF MiniMax H3 transformer was selected, but this ComfyUI installation has no GGUF loader node. "
+            "Install ComfyUI-GGUF and restart ComfyUI."
         )
     loader = loader_class()
     return loader.load_unet(model_name)[0]
@@ -1816,8 +2003,8 @@ def _load_text_encoder(text_encoder: str):
     loader_class = _registered_node_class("CLIPLoaderGGUF", "CLIPLoaderGGUFAdvanced")
     if loader_class is None:
         raise RuntimeError(
-            "检测到 GGUF MiniMax H3 文本编码器，但当前 ComfyUI 未安装 GGUF 加载节点。"
-            "请安装 ComfyUI-GGUF 后重启 ComfyUI。"
+            "A GGUF MiniMax H3 text encoder was selected, but this ComfyUI installation has no GGUF loader node. "
+            "Install ComfyUI-GGUF and restart ComfyUI."
         )
     loader = loader_class()
     try:
@@ -1905,7 +2092,7 @@ class MiniMaxH3Bundle:
             return model
         loader = getattr(comfy.sd, "load_bypass_lora_for_models", None)
         if not callable(loader):
-            raise RuntimeError("当前 ComfyUI 不支持旁路 LoRA 加载，请更新 ComfyUI。")
+            raise RuntimeError("This ComfyUI version does not support bypass LoRA loading. Update ComfyUI and try again.")
         result = model
         for name, strength in stack:
             lora = self._load_lora(name)
@@ -2279,10 +2466,21 @@ def _clone_h3_model_with_memory_features(model, *, force_offload: bool, streamed
 class MiniMaxH3Context:
     conditioning: Any
     latent: Any
+    clip: Any
     video_vae: Any
     audio_vae: Any
     fps: float
     prompt_preview: str
+    audio_1: Any = None
+    duration_control: Any = None
+
+
+@dataclass(frozen=True)
+class H3DurationControl:
+    """Carries the exact Audio 1 duration from Easy H3 to the output cutter."""
+
+    enabled: bool = False
+    target_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -2290,6 +2488,7 @@ class _MediaInput:
     input_index: int
     media_type: str
     value: Any
+    audio_trim: str = ""
 
 
 class _AnyType(str):
@@ -2457,7 +2656,7 @@ class FeiHouEasyH3RemixLoader:
 
     def load(self, remix_model, text_encoder, video_vae, audio_vae, second_sampling_model=NONE_MODEL, first_pass_lora_stack=None, second_pass_lora_stack=None):
         if _is_none_model(remix_model):
-            raise ValueError("请选择 Remix 主模型。")
+            raise ValueError("Select a Remix main model")
         clip = _load_text_encoder(text_encoder)
         video_vae_obj, = nodes.VAELoader().load_vae(video_vae)
         audio_vae_obj, = nodes.VAELoader().load_vae(audio_vae)
@@ -2646,6 +2845,106 @@ def _encode_reference_audio(audio_vae, audio: Mapping):
     return latent, latent.shape[-1]
 
 
+def _audio_trim_seconds(value: Any) -> float:
+    """Parse a forgiving clock component into seconds.
+
+    Besides normal ``MM:SS`` / ``HH:MM:SS`` notation, the embedded widget also
+    accepts plain second counts (``80`` -> ``01:20:000``). The optional third
+    component is milliseconds; values are quantized upward to 100ms.
+    """
+    text = str(value or "").strip().replace("\uff1a", ":").replace("\uff0e", ".")
+    if not text:
+        return 0.0
+    text = re.sub(r"\s+", "", text)
+    if ":" not in text:
+        try:
+            return float(max(0, math.ceil(float(text))))
+        except (TypeError, ValueError):
+            return 0.0
+    parts = text.split(":")
+    if not parts or len(parts) > 4 or any(not part.isdigit() for part in parts):
+        return 0.0
+    values = [int(part) for part in parts]
+    if len(values) == 2:
+        minutes, seconds = values
+        return float(minutes * 60 + seconds)
+    if len(values) == 3:
+        minutes, seconds, milliseconds = values
+        fraction = milliseconds * (10 ** (3 - min(3, len(parts[2])))) / 1000.0
+        return math.floor((minutes * 60 + seconds + fraction) * 10 + 0.5 + 1e-9) / 10.0
+    hours, minutes, seconds, milliseconds = values
+    fraction = milliseconds * (10 ** (3 - min(3, len(parts[3])))) / 1000.0
+    return math.floor((hours * 3600 + minutes * 60 + seconds + fraction) * 10 + 0.5 + 1e-9) / 10.0
+
+
+def _audio_trim_range(value: Any) -> tuple[float, float]:
+    """Return start/end seconds. An absent or zero end means source end."""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0, 0.0
+    parts = re.split(r"\s*(?:-|~|\u2013|\u2014|\u81f3|to)\s*", text, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) == 1:
+        return 0.0, _audio_trim_seconds(parts[0])
+    start, end = _audio_trim_seconds(parts[0]), _audio_trim_seconds(parts[1])
+    if end > 0 and end < start:
+        start, end = end, start
+    return start, end
+
+
+def _trim_reference_audio(audio: Mapping, trim_range: Any) -> Mapping:
+    """Create a cropped AUDIO payload without mutating the loaded source."""
+    if not str(trim_range or "").strip():
+        return audio
+    waveform = audio.get("waveform") if isinstance(audio, Mapping) else None
+    if not isinstance(waveform, torch.Tensor) or waveform.ndim < 1:
+        raise ValueError("Audio references must contain a waveform for time trimming")
+    sample_rate = _audio_sample_rate(audio)
+    if sample_rate <= 0:
+        raise ValueError("Audio reference has an invalid sample rate")
+    total_samples = int(waveform.shape[-1])
+    if total_samples <= 0:
+        raise ValueError("Audio reference is empty")
+    duration = total_samples / float(sample_rate)
+    start, end = _audio_trim_range(trim_range)
+    start = min(max(0.0, start), duration)
+    end = duration if end <= 0 else min(max(0.0, end), duration)
+    if end <= start:
+        raise ValueError("Audio trim end must be later than its start")
+    start_sample = min(total_samples - 1, max(0, int(round(start * sample_rate))))
+    end_sample = min(total_samples, max(start_sample + 1, int(round(end * sample_rate))))
+    trimmed = dict(audio)
+    trimmed["waveform"] = waveform[..., start_sample:end_sample]
+    return trimmed
+
+
+def _reference_audio_duration(items: list[_MediaInput]) -> float:
+    """Return the trimmed duration of Audio 1 for digital-human/MV timing."""
+    for item in items:
+        if item.media_type != "audio":
+            continue
+        if not isinstance(item.value, Mapping) or "waveform" not in item.value:
+            raise ValueError("Digital Human/MV auto duration requires a valid AUDIO reference")
+        trimmed = _trim_reference_audio(item.value, item.audio_trim)
+        waveform = trimmed.get("waveform")
+        sample_rate = float(trimmed.get("sample_rate") or 0)
+        total_samples = int(waveform.shape[-1]) if waveform is not None and getattr(waveform, "ndim", 0) else 0
+        if sample_rate <= 0 or total_samples <= 0:
+            raise ValueError("Digital Human/MV auto duration could not read a valid duration from Audio 1")
+        return total_samples / sample_rate
+    raise ValueError("Digital Human/MV auto duration is enabled, but Audio 1 is not loaded")
+
+
+def _first_reference_audio(items: list[_MediaInput]) -> Any:
+    """Return the first standalone reference audio in the same trimmed form H3 uses."""
+    for item in items:
+        if item.media_type != "audio":
+            continue
+        if not isinstance(item.value, Mapping) or "waveform" not in item.value:
+            raise ValueError("Audio references must be AUDIO payloads")
+        return _trim_reference_audio(item.value, item.audio_trim)
+    return None
+
+
 def _resolve_reference_prompt(
     prompt: str,
     tag_by_input: dict[int, str],
@@ -2686,9 +2985,10 @@ def _canvas_dimensions(resolution: str, aspect_ratio: str, custom_width: int, cu
     return _align_canvas_dimension(ratio_w * scale), _align_canvas_dimension(ratio_h * scale)
 
 
-def _frame_length(seconds: float, fps: float) -> int:
+def _frame_length(seconds: float, fps: float, round_up: bool = False) -> int:
     target_frames = max(5.0, float(seconds) * float(fps))
-    block_count = max(0, round((target_frames - 5) / 17))
+    blocks = (target_frames - 5) / 17
+    block_count = max(0, math.ceil(blocks) if round_up else round(blocks))
     return block_count * 17 + 5
 
 
@@ -2735,18 +3035,21 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         if not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("Image references must be IMAGE tensors")
         image_h, image_w = image.shape[1], image.shape[2]
-        size_mode = str(ref_image_size or REF_IMAGE_DEFAULT)
-        legacy_short_edges = {"match": 480, "1k": 1024, "1.5k": 1088, "2k": 1088, "original": 1088}
-        try:
-            short_edge = int(size_mode)
-        except ValueError:
-            short_edge = legacy_short_edges.get(size_mode, int(REF_IMAGE_DEFAULT))
-        if str(short_edge) not in REFERENCE_SHORT_EDGES:
-            short_edge = min((int(value) for value in REFERENCE_SHORT_EDGES), key=lambda value: abs(value - short_edge))
-        # Resize proportionally so the selected short edge is authoritative,
-        # then choose the nearest H3-compatible 32-pixel canvas.
-        scale = short_edge / max(1, min(image_w, image_h))
-        target_w, target_h = _reference_aligned_size(image_w, image_h, scale)
+        size_mode = str(ref_image_size or REF_IMAGE_DEFAULT).strip().lower()
+        # Match MiniMaxH3ReferenceToVideo exactly: ``match`` fits the reference
+        # to the output pixel area and neither branch ever enlarges a source
+        # image.  Enlarging small references was costly and made Easy H3's
+        # effective visual-token count differ from the official node.
+        if size_mode in {"match", "匹配"}:
+            scale = min(1.0, math.sqrt((width * height) / max(1, image_w * image_h)))
+        else:
+            try:
+                short_edge = int(size_mode)
+            except ValueError:
+                short_edge = int(getattr(h3, "REF_IMAGE_SHORT_EDGE", 2048))
+            scale = min(1.0, short_edge / max(1, min(image_w, image_h)))
+        target_w = max(h3.CANVAS_MULTIPLE, round(image_w * scale / h3.CANVAS_MULTIPLE) * h3.CANVAS_MULTIPLE)
+        target_h = max(h3.CANVAS_MULTIPLE, round(image_h * scale / h3.CANVAS_MULTIPLE) * h3.CANVAS_MULTIPLE)
         resized = h3._resize(image[:1], target_w, target_h, "disabled")
         ref_items.append({"type": "image", "data": resized})
         ref_blocks.append({"kind": "image", "latent_h": target_h // 16, "latent_w": target_w // 16, "latent": bundle.video_vae.encode(resized)})
@@ -2797,7 +3100,10 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
     for item in audios:
         if not isinstance(item.value, Mapping) or "waveform" not in item.value:
             raise ValueError("Audio references must be AUDIO payloads")
-        audio_latent, audio_t = _encode_reference_audio(bundle.audio_vae, item.value)
+        audio_latent, audio_t = _encode_reference_audio(
+            bundle.audio_vae,
+            _trim_reference_audio(item.value, item.audio_trim),
+        )
         audio_ordinal += 1
         ref_items.append({"type": "audio"})
         ref_blocks.append({"kind": "audio", "ref_audio_t": audio_t, "audio_latent": audio_latent})
@@ -2843,6 +3149,7 @@ class FeiHouEasyH3:
             # the visible frontend definition so the gallery is the only UI.
             optional[f"media_{index}"] = ("STRING", {"default": "", "hidden": True})
             optional[f"media_type_{index}"] = ("STRING", {"default": "", "hidden": True})
+            optional[f"media_trim_{index}"] = ("STRING", {"default": "", "hidden": True})
         optional["prompt_optimizer_applied"] = ("BOOLEAN", {"default": False, "hidden": True})
         optional["second_sampling_output_connected"] = ("BOOLEAN", {"default": False, "hidden": True})
         return {
@@ -2854,6 +3161,7 @@ class FeiHouEasyH3:
                 "aspect_ratio": (list(ASPECT_RATIOS), {"default": ASPECT_WIDESCREEN}),
                 "width": ("INT", {"default": 1344, "min": 32, "max": nodes.MAX_RESOLUTION, "step": 32}),
                 "height": ("INT", {"default": 768, "min": 32, "max": nodes.MAX_RESOLUTION, "step": 32}),
+                "audio_duration_auto": ("BOOLEAN", {"default": False}),
                 "seconds": ("FLOAT", {"default": 10.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
                 "advanced": ("BOOLEAN", {"default": False}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
@@ -2896,7 +3204,7 @@ class FeiHouEasyH3:
             resolved_type = media_type if media_type in {"image", "video", "audio"} else _infer_media_type(value)
             if isinstance(value, str):
                 value = _load_embedded_media(value, resolved_type)
-            items.append(_MediaInput(index, resolved_type, value))
+            items.append(_MediaInput(index, resolved_type, value, str(kwargs.get(f"media_trim_{index}") or "")))
         return items
 
     @staticmethod
@@ -2917,7 +3225,7 @@ class FeiHouEasyH3:
         return images[0], images[1]
 
     @classmethod
-    def generate(cls, h3_bundle, mode, prompt, resolution, aspect_ratio, width, height, seconds, advanced, fps, keyframe_role, ref_image_size, reference_mention_mode, prompt_optimizer_enabled=False, prompt_optimizer_provider="", prompt_optimizer_scene_guide="none", force_offload=False, low_vram_streamed_attention=False, prompt_optimizer_applied=False, **kwargs):
+    def generate(cls, h3_bundle, mode, prompt, resolution, aspect_ratio, width, height, audio_duration_auto, seconds, advanced, fps, keyframe_role, ref_image_size, reference_mention_mode, prompt_optimizer_enabled=False, prompt_optimizer_provider="", prompt_optimizer_scene_guide="none", force_offload=False, low_vram_streamed_attention=False, prompt_optimizer_applied=False, **kwargs):
         if not isinstance(h3_bundle, MiniMaxH3Bundle):
             raise ValueError("Connect a FeiHou Easy H3 Loader bundle")
         # ``advanced`` may itself come from an external input. Keep the backend
@@ -2929,8 +3237,17 @@ class FeiHouEasyH3:
         mode = str(mode)
         keyframe_role = KEYFRAME_LAST if str(keyframe_role) == KEYFRAME_LAST else KEYFRAME_FIRST
         width, height = _canvas_dimensions(resolution, aspect_ratio, width, height)
+        items = cls._collect_media(kwargs)
+        audio_duration_enabled = _as_bool(audio_duration_auto)
+        requested_audio_seconds = 0.0
+        if audio_duration_enabled:
+            requested_audio_seconds = _reference_audio_duration(items)
+            seconds = requested_audio_seconds
         seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(seconds)))
-        length = _frame_length(seconds, fps)
+        # MiniMax H3 accepts only 5 + 17N frames.  Automatic audio timing
+        # rounds upward so the output cutter can later restore the exact audio
+        # duration instead of producing a video shorter than its soundtrack.
+        length = _frame_length(seconds, fps, round_up=audio_duration_enabled)
         optimizer_enabled = _as_bool(advanced) and _as_bool(prompt_optimizer_enabled)
         optimizer_already_applied = prompt_optimizer_applied is True or str(prompt_optimizer_applied).strip().lower() in {"1", "true", "yes", "on"}
         if optimizer_enabled and not optimizer_already_applied:
@@ -2946,8 +3263,20 @@ class FeiHouEasyH3:
                     reference_short_edge=ref_image_size,
                 )
             except Exception as exc:
-                raise RuntimeError(f"Easy H3 提示词扩写/反推失败: {exc}") from exc
-        items = cls._collect_media(kwargs)
+                raise RuntimeError(f"Easy H3 prompt expansion/inference failed: {exc}") from exc
+        second_sampling_model = None
+        second_sampling_requested = h3_bundle.second_sampling_enabled and second_sampling_connected
+        second_kind = "ref2va" if mode == MODE_REFERENCE else "fl2va"
+        second_sampling_active = False
+        if second_sampling_requested:
+            second_model_name = h3_bundle.second_ref2va_model_name if second_kind == "ref2va" else h3_bundle.second_fl2va_model_name
+            if _is_none_model(second_model_name):
+                if h3_bundle.remix_loader:
+                    raise ValueError("A second-sampling model output is connected, but the Remix Loader has no second-pass model selected. Select one or disconnect that output.")
+                model_label = "REF2VA" if second_kind == "ref2va" else "FL2VA"
+                raise ValueError(f"A custom second-pass model is enabled, but no {model_label} second-pass model is selected. Select a model or disable the custom second-pass model.")
+            second_sampling_active = True
+
         if mode == MODE_REFERENCE and items:
             if len(items) > MAX_MEDIA:
                 raise ValueError("Reference mode accepts at most fifteen media resources")
@@ -2965,22 +3294,26 @@ class FeiHouEasyH3:
         else:
             first_frame, last_frame = cls._keyframes(items, keyframe_role)
             model = h3_bundle.model_for("fl2va")
-            conditioning, latent = _empty_image_conditioning(h3_bundle, prompt, width, height, length, first_frame, last_frame)
-            prompt_preview = str(prompt or "")
+            # The one H3 Context feeds both passes.  Once a second-pass model
+            # has actually been requested and loaded, use the reference-to-
+            # video representation for that shared context even when the first
+            # pass was started as I2V/FL2V.  This is deliberately internal: it
+            # has no extra UI switch and leaves one-pass I2V/FL2V untouched.
+            if second_sampling_active and items:
+                conditioning, latent, prompt_preview = _reference_conditioning(
+                    h3_bundle, prompt, width, height, length, ref_image_size, items
+                )
+            else:
+                conditioning, latent = _empty_image_conditioning(h3_bundle, prompt, width, height, length, first_frame, last_frame)
+                prompt_preview = str(prompt or "")
         model = _clone_h3_model_with_memory_features(
             model,
             force_offload=h3_bundle.force_offload_enabled,
             streamed_attention=_as_bool(advanced) and _as_bool(low_vram_streamed_attention),
         )
-        second_sampling_model = None
-        if h3_bundle.second_sampling_enabled and second_sampling_connected:
-            second_kind = "ref2va" if mode == MODE_REFERENCE else "fl2va"
-            second_model_name = h3_bundle.second_ref2va_model_name if second_kind == "ref2va" else h3_bundle.second_fl2va_model_name
-            if _is_none_model(second_model_name):
-                if h3_bundle.remix_loader:
-                    raise ValueError("已连接二次采样模型输出，但 Remix 加载器未选择二采模型。请选择“二采模型”，或断开二次采样模型输出。")
-                model_label = "REF2VA" if second_kind == "ref2va" else "FL2VA"
-                raise ValueError(f"“自定义二采模型”已开启，但未选择 {model_label} 二采模型。请选择模型，或关闭该开关。")
+        if second_sampling_active:
+            # Load this after the first-pass model so the memory hand-off hook
+            # can retain the first transformer marker for second sampling.
             second_sampling_model = h3_bundle.second_sampling_model_for(second_kind)
             second_sampling_model = _clone_h3_model_with_memory_features(
                 second_sampling_model,
@@ -2990,10 +3323,16 @@ class FeiHouEasyH3:
         context = MiniMaxH3Context(
             conditioning=conditioning,
             latent=latent,
+            clip=h3_bundle.clip,
             video_vae=h3_bundle.video_vae,
             audio_vae=h3_bundle.audio_vae,
             fps=float(fps),
             prompt_preview=prompt_preview,
+            audio_1=_first_reference_audio(items),
+            duration_control=H3DurationControl(
+                enabled=audio_duration_enabled,
+                target_seconds=requested_audio_seconds,
+            ),
         )
         if h3_bundle.force_offload_enabled:
             _release_auxiliary_models_for_sampling(h3_bundle, phase="first-pass sampling")
@@ -3009,8 +3348,9 @@ class FeiHouEasyH3:
 class FeiHouEasyH3Output:
     CATEGORY = "FeiHou Easy H3"
     FUNCTION = "unpack"
-    RETURN_TYPES = ("CONDITIONING", "LATENT", "VAE", "VAE", "FLOAT", "STRING")
-    RETURN_NAMES = ("positive", "latent", "video_vae", "audio_vae", "fps", "prompt_preview")
+    # Append new outputs so existing saved workflow links retain their slots.
+    RETURN_TYPES = ("CONDITIONING", "LATENT", "VAE", "VAE", "FLOAT", "STRING", "CLIP", "AUDIO", H3_DURATION_CONTROL_TYPE)
+    RETURN_NAMES = ("positive", "latent", "video_vae", "audio_vae", "fps", "prompt_preview", "clip", "audio_1", "duration_control")
     DESCRIPTION = "Unpack the non-model outputs from a FeiHou Easy H3 context."
 
     @classmethod
@@ -3032,7 +3372,57 @@ class FeiHouEasyH3Output:
             h3_context.audio_vae,
             h3_context.fps,
             h3_context.prompt_preview,
+            h3_context.clip,
+            h3_context.audio_1,
+            getattr(h3_context, "duration_control", H3DurationControl()),
         )
+
+
+class FeiHouEasyH3DurationCrop:
+    """Restore the exact Audio 1 duration after H3's required frame alignment.
+
+    The control payload is disabled in ordinary workflows, so this node becomes
+    a pure pass-through unless Digital human/MV auto duration is enabled.
+    """
+
+    CATEGORY = "FeiHou Easy H3"
+    FUNCTION = "crop"
+    RETURN_TYPES = ("IMAGE", "FLOAT", "AUDIO")
+    RETURN_NAMES = ("images", "fps", "audio")
+    DESCRIPTION = "Uses the Easy H3 duration-control output to restore the exact Audio 1 duration. Disabled control passes media through unchanged."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001}),
+                "duration_control": (H3_DURATION_CONTROL_TYPE,),
+            },
+            "optional": {
+                "audio": ("AUDIO",),
+            },
+        }
+
+    @staticmethod
+    def crop(images, fps, duration_control, audio=None):
+        enabled = bool(getattr(duration_control, "enabled", False))
+        target_seconds = float(getattr(duration_control, "target_seconds", 0.0) or 0.0)
+        source_fps = max(0.001, float(fps))
+        if not enabled or target_seconds <= 0.0 or not isinstance(images, torch.Tensor) or images.ndim < 1:
+            return images, source_fps, audio
+
+        source_frames = int(images.shape[0])
+        if source_frames <= 0:
+            return images, source_fps, audio
+        target_frames = max(1, int(round(target_seconds * source_fps)))
+        if target_frames != source_frames:
+            # Uniformly retain/duplicate frames so both first and last frame
+            # survive.  Recomputing FPS then makes the container duration exact.
+            positions = torch.linspace(0, source_frames - 1, target_frames, device=images.device)
+            frame_indices = positions.round().to(dtype=torch.long)
+            images = images.index_select(0, frame_indices)
+        return images, float(target_frames / target_seconds), audio
 
 
 class FeiHouEasyH3PromptPreview:
@@ -3063,5 +3453,6 @@ NODE_CLASS_MAPPINGS = {
     "FeiHouEasyH3ModelBundleBuilder": FeiHouEasyH3ModelBundleBuilder,
     "FeiHouEasyH3": FeiHouEasyH3,
     "FeiHouEasyH3Output": FeiHouEasyH3Output,
+    "FeiHouEasyH3DurationCrop": FeiHouEasyH3DurationCrop,
     "FeiHouEasyH3PromptPreview": FeiHouEasyH3PromptPreview,
 }

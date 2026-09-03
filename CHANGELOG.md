@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.4.2
+
+- Adds a local custom-API host allow-list, validates every outbound prompt-API request, and blocks redirects to unvalidated destinations.
+- Restricts Easy H3 settings, model-discovery, prompt-optimization, and LoRA-list routes to the local ComfyUI host.
+- Documents the allow-list in the Settings UI and both READMEs.
+- Uses English as the backend/default node-language fallback and completes native ComfyUI `locales/en` and `locales/zh` definitions for the Remix Loader and Digital Human/MV Duration Crop.
+
+## v1.4.1
+
+- Adds a play/stop control beside each reference-audio trim range. Preview playback starts at the normalized trim start, stops at the trim end, and never changes the source file or the audio sent to H3.
+
+## v1.4.0
+
+- Adds **Digital human/MV auto duration**. When enabled, Audio 1's trimmed duration controls generation and locks the manual duration field.
+- Adds **FeiHou Easy H3 Digital human/MV Duration Crop** and a matching `duration_control` output on FeiHou Easy H3 Output. H3 now rounds automatic-duration sampling up to its required `5 + 17N` frame count; the crop node restores the precise trimmed-audio duration after decoding, while passing ordinary workflows through unchanged.
+
+## v1.3.12
+
+- Adds per-slot **reference-audio trimming** below the embedded Audio 1–3 gallery. Start and end are separate fields; ranges are saved with their audio when reordered. Times accept forgiving input and normalize to 100ms precision (`MM:SS:MMM`); trimming affects only the temporary H3 audio payload, never the uploaded source file.
+- Adds **CLIP** and trimmed **Audio 1** outputs to FeiHou Easy H3 Output. They are appended after existing outputs so saved workflow links keep their original slot positions.
+- Aligns the reference-image **Match generation size** rule with the official H3 node's downscale-only output-pixel-area behavior. When an I2V/FL2V workflow actually requests second-pass sampling, its shared context now uses H3's reference-to-video latent representation.
+- Prevents the embedded media panel from self-expanding indefinitely in ComfyUI Modern Nodes mode.
+
 ## v1.3.11
 
 - Fixes native ComfyUI external-input support for the embedded Easy H3 UI. Connected widgets now preserve their graph links instead of being overwritten by panel defaults during workflow serialization.
