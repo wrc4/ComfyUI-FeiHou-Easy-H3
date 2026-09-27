@@ -651,6 +651,15 @@ def _validate_optimizer_base_url(api_url: str, api_format: str = "openai") -> st
         raise ValueError("Prompt optimization API URL is invalid")
 
     normalized_format = str(api_format or "openai").strip().lower()
+
+    try:
+       loopback_host = ipaddress.ip_address(host)
+    except ValueError:
+        loopback_host = None
+
+    if host in {"localhost", "127.0.0.1", "::1"} or (loopback_host is not None and loopback_host.is_loopback):
+        return base
+
     # A local administrator must explicitly authorize the scheme, IP and port.
     # No DNS resolution or blanket private-network exemption is involved.
     lan_origin = _lan_api_origin(base, allow_path=True)
