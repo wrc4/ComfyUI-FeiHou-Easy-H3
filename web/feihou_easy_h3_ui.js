@@ -9,6 +9,9 @@ const REMIX_LOADER_CLASS = "FeiHouEasyH3RemixLoader";
 const ADAPTER_CLASS = "FeiHouEasyH3ModelAdapter";
 const OUTPUT_CLASS = "FeiHouEasyH3Output";
 const PROMPT_PREVIEW_CLASS = "FeiHouEasyH3PromptPreview";
+const ENHANCER_CLASS = "CreazyH3PromptEnhancer";
+const ENHANCER_IMAGE_INPUTS = 9;
+const ENHANCER_VIDEO_INPUTS = 3;
 const LINKS_PROP = "minimax_h3_virtual_media_links";
 const EMBEDDED_MEDIA_PROP = "feihou_h3_embedded_media";
 const PROMPT_DOC_PROP = "minimax_h3_prompt_reference_doc";
@@ -101,6 +104,9 @@ const TEXT = {
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
     optimizerDone: ZH_BROWSER ? "\u4f18\u5316\u5b8c\u6210" : "Optimization complete",
     optimizerError: ZH_BROWSER ? "\u4f18\u5316\u5931\u8d25" : "Optimization failed",
+    enhancerTitle: "Creazy H3 Prompt Enhancer",
+    enhancerPlaceholder: ZH_BROWSER ? "\u8f93\u5165\u539f\u59cb\u63d0\u793a\u8bcd\uff0c\u70b9\u51fb\u661f\u6807\u6267\u884c\u63d0\u793a\u8bcd\u589e\u5f3a" : "Enter the original prompt, then click the star to enhance it",
+    enhancerEmptyPrompt: ZH_BROWSER ? "\u8bf7\u5148\u8f93\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002" : "Enter the original prompt first.",
     promptExternalConnected: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u6765\u81ea\u5916\u90e8\u6587\u672c\u8fde\u63a5" : "Prompt supplied by external text input",
     referencePromptPlaceholder: ZH_BROWSER ? "Prompt... \u8f93\u5165 @ \u5f15\u7528\u5df2\u8fde\u63a5\u7d20\u6750" : "Prompt... Type @ to reference connected media",
     mentionTitle: ZH_BROWSER ? "\u5f15\u7528\u7d20\u6750" : "Reference media",
@@ -318,6 +324,10 @@ function isTarget(node) {
     return nodeMatchesClass(node, NODE_CLASS, TEXT.mainTitle, "__feihouStandardH3EasyNodeInstalled");
 }
 
+function isEnhancer(node) {
+    return nodeMatchesClass(node, ENHANCER_CLASS, TEXT.enhancerTitle, "__h3PromptEnhancerInstalled");
+}
+
 function isLoader(node) {
     return nodeMatchesClass(node, LOADER_CLASS, TEXT.loaderTitle, "__feihouStandardH3EasyLoaderInstalled");
 }
@@ -511,7 +521,7 @@ function localizeNodeInstance(node) {
 }
 
 function localizeNodeDefinition(nodeData) {
-    if (!nodeData || ![NODE_CLASS, LOADER_CLASS, REMIX_LOADER_CLASS, ADAPTER_CLASS, OUTPUT_CLASS].includes(nodeData.name)) return;
+    if (!nodeData || ![NODE_CLASS, LOADER_CLASS, REMIX_LOADER_CLASS, ADAPTER_CLASS, OUTPUT_CLASS, ENHANCER_CLASS].includes(nodeData.name)) return;
     nodeData.display_name = nodeData.name === LOADER_CLASS
         ? TEXT.loaderTitle
         : nodeData.name === REMIX_LOADER_CLASS
@@ -520,6 +530,8 @@ function localizeNodeDefinition(nodeData) {
             ? TEXT.adapterTitle
             : nodeData.name === OUTPUT_CLASS
             ? TEXT.outputTitle
+            : nodeData.name === ENHANCER_CLASS
+            ? TEXT.enhancerTitle
             : TEXT.mainTitle;
     nodeData.category = TEXT.category;
 }
@@ -1818,6 +1830,46 @@ function patchGraphToPrompt() {
         const promptData = await original.apply(this, arguments);
         const output = promptData?.output || {};
         for (const node of app.graph?._nodes || []) {
+            if (isEnhancer(node)) {
+                const enhancerNode = output[String(node.id)];
+                if (!enhancerNode) continue;
+                enhancerNode.inputs ||= {};
+                if (node.__h3Editor) syncEnhancerPromptFromEditor(node);
+                const enhancerPrompt = enhancerPromptText(node);
+                const existingEnhancerPrompt = enhancerNode.inputs.prompt;
+                if (!Array.isArray(existingEnhancerPrompt) || existingEnhancerPrompt.length < 2) {
+                    if (!enhancerPromptConnected(node)) enhancerNode.inputs.prompt = enhancerPrompt;
+                }
+                // Combo widgets hold localized labels after settings load, so
+                // the queue payload is rewritten with the canonical ids.
+                const setEnhancerInput = (name, value) => {
+                    const input = (node.inputs || []).find((item) => String(item?.name || "") === name);
+                    const existing = enhancerNode.inputs[name];
+                    if (Array.isArray(existing) && existing.length >= 2) return;
+                    const rawLink = input?.link ?? (Array.isArray(input?.links) ? input.links[0] : null);
+                    if (rawLink != null) {
+                        const link = getNativeGraphLink(node.graph || app.graph, rawLink);
+                        const originId = link?.origin_id ?? link?.originId;
+                        const originSlot = link?.origin_slot ?? link?.originSlot ?? 0;
+                        if (originId != null) {
+                            enhancerNode.inputs[name] = [String(originId), Number(originSlot) || 0];
+                            return;
+                        }
+                    }
+                    enhancerNode.inputs[name] = value;
+                };
+                setEnhancerInput("mode", canonicalOption("mode", getWidgetValue(node, "mode", MODE_REFERENCE)));
+                setEnhancerInput("seconds", Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 10)) || 10)));
+                setEnhancerInput("prompt_optimizer_provider", canonicalPromptProvider(getWidgetValue(node, "prompt_optimizer_provider", "")));
+                setEnhancerInput("prompt_optimizer_scene_guide", canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none")));
+                // The DOM editor replaces the native prompt widget, so the
+                // hidden applied flag has to be written explicitly.
+                enhancerNode.inputs.prompt_optimizer_applied = Boolean(
+                    node.__h3OptimizerLastResult
+                    && enhancerPrompt === String(node.__h3OptimizerLastResult),
+                );
+                continue;
+            }
             if (!isTarget(node)) continue;
             const promptNode = output[String(node.id)];
             if (!promptNode) continue;
@@ -3362,7 +3414,7 @@ function syncEditorThemes(force = false) {
     if (!force && lastVueNodesMode === modern) return;
     lastVueNodesMode = modern;
     for (const node of app.graph?._nodes || []) {
-        if (!isTarget(node)) continue;
+        if (!isTarget(node) && !isEnhancer(node)) continue;
         applyNativeEditorTheme(node.__h3EditorWrap);
         applyNativeEditorTheme(node.__h3MentionMenu?.element);
     }
@@ -3844,13 +3896,18 @@ function promptOptimizerNodes() {
     // app.graph is a guarded getter and logs an initialization error when the
     // settings request completes before the first workflow canvas exists.
     // The canvas graph is equivalent once ready and can be checked quietly.
-    return (app.canvas?.graph?._nodes || []).filter((node) => isTarget(node));
+    return (app.canvas?.graph?._nodes || []).filter((node) => isTarget(node) || isEnhancer(node));
 }
 
 function syncPromptOptimizerNodes() {
     for (const node of promptOptimizerNodes()) {
         localizeComboWidget(getWidget(node, "prompt_optimizer_provider"));
         localizeComboWidget(getWidget(node, "prompt_optimizer_scene_guide"));
+        if (isEnhancer(node)) {
+            syncEnhancerOptimizeButton(node);
+            node.setDirtyCanvas?.(true, true);
+            continue;
+        }
         syncModeWidgets(node, { adjustHeight: false });
         syncPromptOptimizerButton(node);
         node.setDirtyCanvas?.(true, true);
@@ -4114,6 +4171,353 @@ async function optimizePromptFromEditor(node) {
         node.__h3OptimizerPending = false;
         syncPromptOptimizerButton(node);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Creazy H3 Prompt Enhancer
+//
+// The main node keeps its references in the embedded gallery.  This node owns
+// only the enhancement workflow: reference images/videos arrive through node
+// inputs, the raw prompt is typed into the prompt box, and the star in that box
+// rewrites it in place with the configured API service/model and Prompt Guide.
+// ---------------------------------------------------------------------------
+
+function enhancerPromptConnected(node) {
+    const input = (node?.inputs || []).find((item) => String(item?.name || "") === "prompt");
+    const link = input?.link ?? (Array.isArray(input?.links) ? input.links[0] : null);
+    return link != null;
+}
+
+function enhancerPromptText(node) {
+    return String(getWidget(node, "prompt")?.value ?? "");
+}
+
+function stripPromptFence(value) {
+    const text = String(value ?? "").trim();
+    if (!text.startsWith("```")) return text;
+    return text
+        .replace(/^```[A-Za-z0-9_-]*[ \t]*\r?\n?/, "")
+        .replace(/\r?\n?```$/, "")
+        .trim();
+}
+
+function setEnhancerPromptText(node, value) {
+    const widget = getWidget(node, "prompt");
+    if (!widget) return;
+    widget.value = value;
+    if (widget._state) widget._state.value = value;
+}
+
+function syncEnhancerPromptFromEditor(node) {
+    const editor = node?.__h3Editor;
+    if (!editor) return;
+    setEnhancerPromptText(node, editorText(editor));
+    node.setDirtyCanvas?.(true, true);
+}
+
+function renderEnhancerEditorFromNode(node, force = false) {
+    const editor = node?.__h3Editor;
+    if (!editor) return;
+    if (!force && document.activeElement === editor) return;
+    const text = enhancerPromptText(node);
+    if (editorText(editor) === text) return;
+    editor.textContent = text;
+}
+
+function syncEnhancerOptimizeButton(node) {
+    const button = node?.__h3PromptOptimizeButton;
+    if (!button) return;
+    const state = promptOptimizerState(node);
+    const keyReady = state.api_format === "ollama" || state.api_key_exists || Boolean(String(state.api_key || "").trim());
+    const configured = Boolean(
+        state.requested_provider
+        && state.requested_model
+        && String(state.api_url || "").trim()
+        && keyReady,
+    );
+    const pending = Boolean(node.__h3OptimizerPending);
+    const connected = enhancerPromptConnected(node);
+    button.title = connected
+        ? TEXT.promptExternalConnected
+        : configured
+            ? TEXT.optimizePrompt
+            : state.requested_provider
+                ? TEXT.optimizerMissing
+                : TEXT.optimizerDisabled;
+    button.setAttribute("aria-label", button.title);
+    button.classList.toggle("is-configured", configured);
+    button.classList.toggle("is-loading", pending);
+    button.classList.toggle("is-external", connected);
+    const locked = pending || connected || !configured;
+    button.disabled = locked;
+    button.setAttribute("aria-disabled", locked ? "true" : "false");
+    const editor = node?.__h3Editor;
+    if (editor) {
+        editor.contentEditable = connected ? "false" : "true";
+        editor.setAttribute("aria-readonly", connected ? "true" : "false");
+        editor.setAttribute("aria-busy", pending ? "true" : "false");
+        editor.classList.toggle("is-loading", pending);
+        editor.classList.toggle("is-external", connected);
+        editor.title = connected ? TEXT.promptExternalConnected : pending ? TEXT.optimizerRunning : "";
+    }
+    node.__h3EditorWrap?.classList?.toggle("is-loading", pending);
+}
+
+function bindEnhancerOptimizerWidgetCallbacks(node) {
+    for (const name of ["prompt_optimizer_provider", "prompt_optimizer_scene_guide"]) {
+        const widget = getWidget(node, name);
+        if (!widget || widget.__h3PromptOptimizerCallbackBound) continue;
+        widget.__h3PromptOptimizerCallbackBound = true;
+        const original = widget.callback;
+        widget.callback = (value) => {
+            original?.call(widget, value);
+            localizeComboWidget(widget);
+            syncEnhancerOptimizeButton(node);
+            node.setDirtyCanvas?.(true, true);
+            app.graph?.change?.();
+        };
+    }
+}
+
+// Socket references are already executed graph payloads, so the star can only
+// describe them by the file an upstream loader still exposes.
+function enhancerInputSource(node, inputName) {
+    const input = (node?.inputs || []).find((item) => String(item?.name || "") === inputName);
+    const linkId = input?.link ?? (Array.isArray(input?.links) ? input.links[0] : null);
+    if (linkId == null) return null;
+    const graph = node.graph || app.graph;
+    const link = getNativeGraphLink(graph, linkId);
+    const originId = link?.origin_id ?? link?.originId;
+    if (originId == null) return null;
+    return (graph?._nodes || []).find((item) => String(item?.id) === String(originId)) || null;
+}
+
+function enhancerInputMedia(node) {
+    const counts = { image: 0, video: 0, audio: 0 };
+    const resources = [];
+    const collect = (inputName, mediaType) => {
+        const source = enhancerInputSource(node, inputName);
+        if (!source) return;
+        counts[mediaType] += 1;
+        const asset = sourceAssetDescriptor(source, mediaType);
+        if (!asset) return;
+        resources.push({
+            type: mediaType,
+            tag: promptMentionTag(mediaType, counts[mediaType]),
+            name: asset.filename,
+            asset,
+        });
+    };
+    for (let index = 1; index <= ENHANCER_IMAGE_INPUTS; index += 1) collect(`image_${index}`, "image");
+    for (let index = 1; index <= ENHANCER_VIDEO_INPUTS; index += 1) collect(`video_${index}`, "video");
+    return { counts, resources };
+}
+
+async function enhancePromptFromEditor(node) {
+    if (!node || node.__h3OptimizerPending || enhancerPromptConnected(node)) return;
+    syncEnhancerPromptFromEditor(node);
+    try {
+        await loadPromptOptimizerSettings();
+    } catch (error) {
+        notifyPromptOptimizer(error?.message || TEXT.settingsLoadFailed);
+        return;
+    }
+    const state = promptOptimizerState(node);
+    if (!state.requested_provider || !state.requested_model) {
+        notifyPromptOptimizer(TEXT.optimizerDisabled, "warn");
+        return;
+    }
+    const keyReady = state.api_format === "ollama" || state.api_key_exists || Boolean(String(state.api_key || "").trim());
+    if (!String(state.api_url || "").trim() || !String(state.requested_model || "").trim() || !keyReady) {
+        notifyPromptOptimizer(TEXT.optimizerMissing);
+        return;
+    }
+    const currentPrompt = enhancerPromptText(node);
+    // Clicking the star twice must refine the original text, not the result.
+    const sourcePrompt = node.__h3OptimizerLastResult === currentPrompt && node.__h3OptimizerSourcePrompt != null
+        ? node.__h3OptimizerSourcePrompt
+        : currentPrompt;
+    if (!sourcePrompt.trim()) {
+        notifyPromptOptimizer(TEXT.enhancerEmptyPrompt, "warn");
+        return;
+    }
+    const media = enhancerInputMedia(node);
+    node.__h3OptimizerPending = true;
+    node.__h3OptimizerStartedAt = globalThis.performance?.now?.() || Date.now();
+    setPromptOptimizerStatus(node, "loading");
+    syncEnhancerOptimizeButton(node);
+    try {
+        const response = await api.fetchApi("/feihou_easy_h3/prompt_optimize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                prompt: sourcePrompt,
+                mode: canonicalOption("mode", getWidgetValue(node, "mode", MODE_REFERENCE)),
+                seconds: Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 10)) || 10)),
+                service_model: state.requested_service,
+                provider_id: state.requested_provider,
+                model: state.requested_model,
+                scene_guide: canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none")),
+                media_counts: media.counts,
+                resources: media.resources,
+            }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        node.__h3OptimizerSourcePrompt = sourcePrompt;
+        node.__h3OptimizerLastResult = stripPromptFence(data.prompt);
+        setEnhancerPromptText(node, node.__h3OptimizerLastResult);
+        renderEnhancerEditorFromNode(node, true);
+        setPromptOptimizerStatus(node, "success");
+        notifyPromptOptimizer(
+            `${TEXT.optimizerDone} \u00b7 ${data.provider_id || state.requested_provider}/${data.model || state.requested_model}`,
+            "success",
+        );
+    } catch (error) {
+        setPromptOptimizerStatus(node, "error");
+        notifyPromptOptimizer(error?.message || error);
+    } finally {
+        node.__h3OptimizerPending = false;
+        syncEnhancerOptimizeButton(node);
+        node.setDirtyCanvas?.(true, true);
+        app.graph?.change?.();
+    }
+}
+
+function removeEnhancerEditorWidgets(node) {
+    if (!Array.isArray(node?.widgets)) return false;
+    const stale = node.widgets.filter((widget) => String(widget?.name || "") === "h3_prompt_enhancer");
+    if (!stale.length) return false;
+    for (const widget of stale) {
+        try {
+            widget.element?.remove?.();
+        } catch { /* Already detached. */ }
+    }
+    node.widgets = node.widgets.filter((widget) => !stale.includes(widget));
+    if (Array.isArray(node._widgets)) node._widgets = node._widgets.filter((widget) => !stale.includes(widget));
+    node.__h3PromptEnhancerWidget = null;
+    return true;
+}
+
+function ensureEnhancerEditor(node) {
+    if (node.__h3Editor) return;
+    if (typeof document === "undefined" || typeof node.addDOMWidget !== "function") return;
+    removeEnhancerEditorWidgets(node);
+    const widget = getWidget(node, "prompt");
+    if (!widget) return;
+    hideOriginalPromptWidget(widget);
+    const wrap = document.createElement("div");
+    wrap.className = "h3-prompt-editor-wrap h3-prompt-enhancer-wrap";
+    wrap.style.minHeight = "0px";
+    applyNativeEditorTheme(wrap);
+    const editor = document.createElement("div");
+    editor.className = "comfy-multiline-input h3-prompt-editor";
+    editor.contentEditable = "true";
+    editor.tabIndex = 0;
+    editor.spellcheck = false;
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-label", "prompt");
+    editor.dataset.placeholder = TEXT.enhancerPlaceholder;
+    const status = document.createElement("div");
+    status.className = "h3-prompt-editor-status";
+    status.hidden = true;
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    const statusSpinner = document.createElement("span");
+    statusSpinner.className = "h3-prompt-editor-status-spinner";
+    const statusText = document.createElement("span");
+    status.append(statusSpinner, statusText);
+    const tools = document.createElement("div");
+    tools.className = "h3-prompt-editor-tools";
+    const optimizeButton = document.createElement("button");
+    optimizeButton.type = "button";
+    optimizeButton.className = "h3-prompt-editor-tool h3-prompt-editor-optimize";
+    optimizeButton.textContent = "\u2726";
+    optimizeButton.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+    });
+    optimizeButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        enhancePromptFromEditor(node);
+    });
+    tools.append(optimizeButton);
+    editor.addEventListener("input", () => {
+        syncEnhancerPromptFromEditor(node);
+    });
+    editor.addEventListener("blur", () => {
+        syncEnhancerPromptFromEditor(node);
+    });
+    editor.addEventListener("pointerdown", (event) => {
+        event.stopPropagation();
+    });
+    editor.addEventListener("wheel", (event) => {
+        const maxScrollTop = Math.max(0, editor.scrollHeight - editor.clientHeight);
+        event.stopPropagation();
+        if (maxScrollTop > 0) event.stopImmediatePropagation?.();
+    }, { passive: true });
+    editor.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+    });
+    wrap.append(editor, status, tools);
+    const domWidget = node.addDOMWidget("h3_prompt_enhancer", "h3_prompt_enhancer", wrap, {
+        serialize: false,
+        margin: 0,
+        getMinHeight: () => 126,
+    });
+    if (!domWidget) {
+        restoreOriginalPromptWidget(widget);
+        wrap.remove();
+        return;
+    }
+    domWidget.serialize = false;
+    setWidgetOption(domWidget, "serialize", false);
+    // Keep the prompt box directly under the (hidden) prompt widget so it stays
+    // above the numeric rows and reference sockets.
+    const domIndex = node.widgets?.indexOf(domWidget) ?? -1;
+    const promptIndex = node.widgets?.indexOf(widget) ?? -1;
+    if (domIndex >= 0 && promptIndex >= 0 && domIndex !== promptIndex + 1) {
+        node.widgets.splice(domIndex, 1);
+        node.widgets.splice(promptIndex + 1, 0, domWidget);
+        refreshVueNodeWidgets(node);
+    }
+    node.__h3PromptEnhancerWidget = domWidget;
+    node.__h3Editor = editor;
+    node.__h3EditorWrap = wrap;
+    node.__h3PromptOptimizeButton = optimizeButton;
+    node.__h3PromptOptimizerStatus = status;
+    node.__h3PromptOptimizerStatusText = statusText;
+    renderEnhancerEditorFromNode(node, true);
+    syncEnhancerOptimizeButton(node);
+    if (Array.isArray(node.size) && node.size[0] > 0 && node.size[0] < 380) node.setSize?.([380, node.size[1]]);
+    repairNodeLayout(node);
+}
+
+function installEnhancerEditorSoon(node) {
+    if (!node || node.__h3Editor || node.__h3EditorInstallPending || node.__h3EditorInstallRetry) return;
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (now < (Number(node.__h3EditorInstallNextAt) || 0)) return;
+    node.__h3EditorInstallPending = true;
+    const run = () => {
+        node.__h3EditorInstallPending = false;
+        ensureEnhancerEditor(node);
+        if (node.__h3Editor) {
+            node.__h3EditorInstallAttempts = 0;
+            node.__h3EditorInstallNextAt = 0;
+            return;
+        }
+        const attempts = Math.min(8, (Number(node.__h3EditorInstallAttempts) || 0) + 1);
+        const delay = Math.min(2000, 120 * (2 ** Math.min(attempts - 1, 4)));
+        node.__h3EditorInstallAttempts = attempts;
+        node.__h3EditorInstallNextAt = (typeof performance !== "undefined" ? performance.now() : Date.now()) + delay;
+        node.__h3EditorInstallRetry = setTimeout(() => {
+            node.__h3EditorInstallRetry = null;
+            installEnhancerEditorSoon(node);
+        }, delay);
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else setTimeout(run, 0);
 }
 
 function syncEditorMode(node) {
@@ -6366,6 +6770,97 @@ function installResolutionNode(nodeType, nodeData) {
     };
 }
 
+function installCreazyPromptEnhancerNode(nodeType, nodeData) {
+    if (nodeData?.name !== ENHANCER_CLASS) return;
+    if (nodeType.prototype.__h3PromptEnhancerInstalled) return;
+    nodeType.prototype.__h3PromptEnhancerInstalled = true;
+
+    const originalCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function onNodeCreatedCreazyEnhancer() {
+        const result = originalCreated?.apply(this, arguments);
+        const node = this;
+        // Captured before the DOM editor joins the widget list so saved
+        // workflows keep the canonical prompt/mode/seconds/service/guide order.
+        node.__h3EnhancerCanonicalNames = (node.widgets || []).map((widget) => String(widget?.name || ""));
+        node.__h3EnhancerDefaults = Object.fromEntries(
+            (node.widgets || []).map((widget) => [String(widget?.name || ""), widget?.value]),
+        );
+        bindEnhancerOptimizerWidgetCallbacks(node);
+        installEnhancerEditorSoon(node);
+        return result;
+    };
+
+    const originalConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function onConfigureCreazyEnhancer(info) {
+        const result = originalConfigure?.apply(this, arguments);
+        const node = this;
+        const names = node.__h3EnhancerCanonicalNames || [];
+        const named = info?.widgets_values_named || {};
+        const positional = Array.isArray(info?.widgets_values) ? info.widgets_values : [];
+        names.forEach((name, index) => {
+            const widget = getWidget(node, name);
+            const value = named[name] ?? positional[index] ?? node.__h3EnhancerDefaults?.[name];
+            if (!widget || value === undefined) return;
+            widget.value = value;
+            if (widget._state) widget._state.value = value;
+        });
+        bindEnhancerOptimizerWidgetCallbacks(node);
+        renderEnhancerEditorFromNode(node, true);
+        syncEnhancerOptimizeButton(node);
+        installEnhancerEditorSoon(node);
+        return result;
+    };
+
+    const originalSerialize = nodeType.prototype.onSerialize;
+    nodeType.prototype.onSerialize = function onSerializeCreazyEnhancer(info) {
+        const result = originalSerialize?.apply(this, arguments);
+        const names = this.__h3EnhancerCanonicalNames || [];
+        if (info && names.length) {
+            info.widgets_values = names.map((name) => getWidget(this, name)?.value ?? null);
+            info.widgets_values_named = Object.fromEntries(
+                names.map((name, index) => [name, info.widgets_values[index]]),
+            );
+        }
+        return result;
+    };
+
+    const originalDraw = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function onDrawForegroundCreazyEnhancer(ctx) {
+        const result = originalDraw?.apply(this, arguments);
+        if (!this.__h3Editor) installEnhancerEditorSoon(this);
+        return result;
+    };
+
+    const originalConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function onConnectionsChangeCreazyEnhancer(type, index, connected, linkInfo) {
+        const result = originalConnectionsChange?.apply(this, arguments);
+        const input = this.inputs?.[Number(index)];
+        if (String(input?.name || "") === "prompt") {
+            syncEnhancerOptimizeButton(this);
+            globalThis.requestAnimationFrame?.(() => syncEnhancerOptimizeButton(this));
+        }
+        return result;
+    };
+
+    const originalRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function onRemovedCreazyEnhancer() {
+        clearPromptOptimizerStatusTimers(this);
+        if (this.__h3EditorInstallRetry) clearTimeout(this.__h3EditorInstallRetry);
+        this.__h3EditorInstallRetry = null;
+        this.__h3EditorInstallPending = false;
+        this.__h3EditorInstallAttempts = 0;
+        this.__h3EditorInstallNextAt = 0;
+        this.__h3EditorWrap?.remove?.();
+        this.__h3Editor = null;
+        this.__h3EditorWrap = null;
+        this.__h3PromptOptimizeButton = null;
+        this.__h3PromptOptimizerStatus = null;
+        this.__h3PromptOptimizerStatusText = null;
+        removeEnhancerEditorWidgets(this);
+        return originalRemoved?.apply(this, arguments);
+    };
+}
+
 function installFaceRefineNode(nodeType, nodeData) {
     if (nodeData?.name !== "FeiHouEasyH3FaceRefine") return;
     const sync = node => {
@@ -6426,6 +6921,7 @@ app.registerExtension({
         install();
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
+        installCreazyPromptEnhancerNode(nodeType, nodeData);
         installFaceRefineNode(nodeType, nodeData);
         installResolutionNode(nodeType, nodeData);
         localizeNodeDefinition(nodeData);

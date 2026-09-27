@@ -235,5 +235,37 @@
     "outputs": {
       "0": { "name": "文本" }
     }
+  },
+  "CreazyH3PromptEnhancer": {
+    "display_name": "Creazy H3 Prompt Enhancer",
+    "description": "使用已配置的 API 服务/模型与提示词方案，把原始提示词增强为 MiniMax H3 官方格式提示词。接入最多 9 张图片和 3 段视频，填写原始提示词后点击文本框星标或直接排队执行。",
+    "inputs": {
+      "prompt": { "name": "提示词" },
+      "mode": {
+        "name": "模式",
+        "options": {
+          "image": "图生或首尾帧",
+          "reference": "参考生视频"
+        }
+      },
+      "seconds": { "name": "秒数" },
+      "prompt_optimizer_provider": { "name": "API 服务/模型" },
+      "prompt_optimizer_scene_guide": { "name": "提示词方案" },
+      "image_1": { "name": "图片 1" },
+      "image_2": { "name": "图片 2" },
+      "image_3": { "name": "图片 3" },
+      "image_4": { "name": "图片 4" },
+      "image_5": { "name": "图片 5" },
+      "image_6": { "name": "图片 6" },
+      "image_7": { "name": "图片 7" },
+      "image_8": { "name": "图片 8" },
+      "image_9": { "name": "图片 9" },
+      "video_1": { "name": "视频 1" },
+      "video_2": { "name": "视频 2" },
+      "video_3": { "name": "视频 3" }
+    },
+    "outputs": {
+      "0": { "name": "增强后提示词" }
+    }
   }
 }

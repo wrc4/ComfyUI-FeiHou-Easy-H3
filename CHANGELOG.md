@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Adds `Creazy H3 Prompt Enhancer` (`CreazyH3PromptEnhancer`), a standalone prompt-enhancement node. Reference media is connected through node inputs instead of the embedded gallery: 9 optional `IMAGE` sockets and 3 optional video sockets that accept either a native `VIDEO` payload or an `IMAGE` frame batch.
+- Keeps only enhancement-related widgets: `mode`, `seconds`, `API service/model` (`prompt_optimizer_provider`) and `Prompt Guide` (`prompt_optimizer_scene_guide`). All generation widgets (resolution, aspect ratio, custom width/height, FPS, keyframe role, reference size, mention mode, offload options, advanced switch) are gone.
+- The prompt box carries the same star as the main node: it calls the local `/feihou_easy_h3/prompt_optimize` route with the connected references (resolved from upstream loader filenames when available) and writes the enhanced prompt back into the box. Queueing the node enhances through the graph instead, attaching the connected images and sampled video frames directly from the executed payloads.
+- Reuses the existing prompt-optimizer settings, allow-list and Prompt Guide catalog; `enhanced_prompt` is a `STRING` output so the result can feed the main node or any other text input.
+- Validation: Python and JavaScript syntax checks, ComfyUI `validate_inputs` runs for widget, hidden-flag and linked-socket cases, and offline checks of the tensor/video JPEG evidence encoder plus the inline-media optimizer path. No live API call or GPU run was performed.
+
 ## v1.4.9
 
 - Checks standard linear LoRA dimensions before bypass loading. Skips incompatible layers with per-layer warnings and a partial-load summary; rejects LoRAs with no usable matched layers.

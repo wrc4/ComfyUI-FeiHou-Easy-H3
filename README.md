@@ -29,6 +29,7 @@
 - `FeiHou Easy H3 Model Adapter`：接入外部标准 ComfyUI 模型加载链；
 - `FeiHou Easy H3 Output`：拆出 Conditioning、Latent、视频 VAE、音频 VAE、FPS 和最终提示词；
 - `FeiHou Easy H3 提示词预览`：显示 H3 Context 携带的最终扩写 / 反推提示词。
+- `Creazy H3 Prompt Enhancer`：独立的提示词增强节点。参考素材改为通过节点输入接入（最多 9 张图片、3 段视频），在文本框里填写原始提示词后点击右侧星标即可就地增强；参数只保留增强相关项（模式、时长）以及 `API 服务/模型` 与 `提示词方案`，其余生成参数全部移除。节点输出增强后的提示词，可直接接到主节点的 `prompt`；未点击星标而直接排队时，节点会用已连接的参考素材在采样前增强一次。
 
 节点分类为 `FeiHou Easy H3`，类名使用独立的 `FeiHouEasyH3*` 前缀，可与原版 `ComfyUI-MiniMaxH3-Easy` 同时安装，不会发生节点 ID 或提示词优化路由冲突。
 

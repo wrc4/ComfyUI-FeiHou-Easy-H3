@@ -34,6 +34,7 @@ Nodes appear under `FeiHou Easy H3`:
 - `FeiHou Easy H3 Model Adapter`
 - `FeiHou Easy H3 Output`
 - `FeiHou Easy H3 Prompt Preview`
+- `Creazy H3 Prompt Enhancer` (standalone prompt enhancement: up to 9 images and 3 videos through node inputs, click the star in the prompt box to rewrite the text in place, then feed `enhanced_prompt` into the main node)
 
 Place the LoRA stack to the left of `FeiHou Easy H3 Loader` and connect its `lora_stack` output to the loader's left-side `LoRA stack` input. The loader applies every enabled LoRA internally; the LoRA node is not inserted into the main node's downstream `MODEL` chain.
 

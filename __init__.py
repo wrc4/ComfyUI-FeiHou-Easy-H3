@@ -1,4 +1,5 @@
 from .nodes import (
+    CreazyH3PromptEnhancer,
     FeiHouEasyH3Resolution,
     FeiHouEasyH3,
     FeiHouEasyH3Loader,
@@ -14,6 +15,7 @@ from .production_pack import FeiHouEasyH3ProductionPackLoader
 from .face_refine import FeiHouEasyH3FaceRefine
 
 NODE_CLASS_MAPPINGS = {
+    "CreazyH3PromptEnhancer": CreazyH3PromptEnhancer,
     "FeiHouEasyH3FaceRefine": FeiHouEasyH3FaceRefine,
     "FeiHouEasyH3Resolution": FeiHouEasyH3Resolution,
     "FeiHouEasyH3ProductionPackLoader": FeiHouEasyH3ProductionPackLoader,
@@ -28,6 +30,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "CreazyH3PromptEnhancer": "Creazy H3 Prompt Enhancer",
     "FeiHouEasyH3FaceRefine": "FeiHou Easy H3 Face Refine (Experimental)",
     "FeiHouEasyH3Resolution": "FeiHou Easy H3 Resolution",
     "FeiHouEasyH3ProductionPackLoader": "FeiHou Easy H3 Production Pack Loader",

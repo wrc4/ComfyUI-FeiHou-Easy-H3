@@ -1548,6 +1548,87 @@ def _optimizer_image_jpeg(path: str, short_edge: int) -> bytes:
         return _optimizer_jpeg_bytes(image, short_edge)
 
 
+def _optimizer_frame_jpeg_bytes(frame: Any, short_edge: int) -> bytes:
+    """Encode one graph IMAGE frame so an API can read it without touching H3."""
+    import numpy as np
+    from PIL import Image
+
+    value = frame
+    if isinstance(value, torch.Tensor):
+        value = value.detach().to("cpu")
+        if value.ndim == 4:
+            value = value[0]
+        if value.ndim == 3 and value.shape[-1] not in (1, 3, 4) and value.shape[0] in (1, 3, 4):
+            value = value.permute(1, 2, 0)
+        if value.dtype != torch.uint8:
+            value = (value.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        array = value.numpy()
+    else:
+        array = np.asarray(value)
+        if array.dtype != np.uint8:
+            array = (np.clip(array.astype("float32"), 0.0, 1.0) * 255.0).round().astype("uint8")
+    if array.ndim != 3 or array.shape[-1] not in (1, 3, 4):
+        raise ValueError("Unsupported image frame layout")
+    if array.shape[-1] == 1:
+        array = array[..., 0]
+    return _optimizer_jpeg_bytes(Image.fromarray(array), short_edge)
+
+
+def _optimizer_video_frame_jpegs(value: Any, short_edge: int) -> list[bytes]:
+    """Sample first/middle/last frames of a connected video payload."""
+    frames, _audio, _fps = _video_parts(value)
+    if not isinstance(frames, torch.Tensor):
+        raise ValueError("Unsupported video payload")
+    total = int(frames.shape[0])
+    if total <= 0:
+        return []
+    indexes = [0] if total == 1 else sorted({0, total // 2, total - 1})
+    encoded: list[bytes] = []
+    for index in indexes[:PROMPT_OPTIMIZER_VIDEO_SAMPLE_COUNT]:
+        try:
+            encoded.append(_optimizer_frame_jpeg_bytes(frames[index], short_edge))
+        except (OSError, ValueError, ImportError):
+            continue
+    return encoded
+
+
+def _optimizer_inline_media_parts(
+    inline_media: list[Mapping[str, Any]] | None,
+    api_format: str,
+    reference_short_edge: Any = REF_IMAGE_DEFAULT,
+) -> list[dict[str, Any]]:
+    """Turn socket-connected IMAGE/VIDEO payloads into compact API image parts."""
+    parts: list[dict[str, Any]] = []
+    short_edge = _optimizer_reference_short_edge(reference_short_edge)
+    for item in list(inline_media or [])[:MAX_MEDIA]:
+        if not isinstance(item, Mapping):
+            continue
+        media_type = str(item.get("type") or "").strip().lower()
+        value = item.get("value")
+        if value is None:
+            continue
+        try:
+            if media_type == "image":
+                encoded = base64.b64encode(_optimizer_frame_jpeg_bytes(value, short_edge)).decode("ascii")
+                parts.append(_optimizer_encoded_image_part(encoded, api_format))
+            elif media_type == "video":
+                for jpeg in _optimizer_video_frame_jpegs(value, short_edge):
+                    parts.append(_optimizer_encoded_image_part(base64.b64encode(jpeg).decode("ascii"), api_format))
+        except (OSError, ValueError, ImportError, RuntimeError):
+            continue
+    return parts
+
+
+def _strip_prompt_fence(value: Any) -> str:
+    """Remove a wrapping markdown fence that some APIs add around the prompt."""
+    text = str(value or "").strip()
+    if not text.startswith("```"):
+        return text
+    text = re.sub(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?", "", text)
+    text = re.sub(r"\r?\n?```$", "", text)
+    return text.strip()
+
+
 def _optimizer_video_keyframes(path: str) -> list[Any]:
     """Read approximate first/middle/last video frames without sending video bytes."""
     import av
@@ -1721,6 +1802,7 @@ def _run_configured_prompt_optimizer(
     resources: list[Mapping[str, Any]] | None = None,
     settings: Mapping[str, Any] | None = None,
     reference_short_edge: Any = REF_IMAGE_DEFAULT,
+    inline_media: list[Mapping[str, Any]] | None = None,
 ) -> tuple[str, str, str]:
     config = settings if isinstance(settings, Mapping) else _read_prompt_optimizer_config()
     provider = _active_optimizer_provider(config, service_model)
@@ -1749,11 +1831,16 @@ def _run_configured_prompt_optimizer(
     configured_vlm = str(provider.get("vlm_model") or "").strip()
     selected_is_vlm = bool(requested_model and requested_model in vlm_models)
     media_model = requested_model if selected_is_vlm else (configured_vlm if not requested_model else "")
-    media_parts = (
-        _optimizer_media_parts(resource_items, api_format, reference_short_edge)
-        if bool(config.get("read_media")) and media_model
-        else []
-    )
+    if bool(config.get("read_media")) and media_model:
+        # Socket-connected media arrives as already loaded graph payloads;
+        # file-backed resources are resolved from the ComfyUI input folder.
+        media_parts = (
+            _optimizer_inline_media_parts(inline_media, api_format, reference_short_edge)
+            if inline_media
+            else _optimizer_media_parts(resource_items, api_format, reference_short_edge)
+        )
+    else:
+        media_parts = []
     model = media_model if media_parts else requested_model or str(provider.get("llm_model") or "").strip()
     requires_key = api_format != "ollama"
     if not str(prompt or "").strip():
@@ -1823,6 +1910,113 @@ class MiniMaxH3PromptOptimizer:
         counts = {"image": 0, "video": 0, "audio": 0}
         system = _optimizer_system_prompt(str(scene_guide or "none"), str(mode or MODE_IMAGE), float(seconds), counts)
         return (_optimizer_http_json(str(api_url), str(api_key), str(model), str(api_format or "openai"), system, str(prompt or "")),)
+
+
+class CreazyH3PromptEnhancer:
+    """Standalone prompt enhancement for MiniMax H3 with socket references.
+
+    The main Easy H3 node keeps its references inside the embedded media
+    gallery.  This node exposes the same prompt-enhancement pipeline on its
+    own: reference images and videos arrive through node inputs, the original
+    prompt is typed into the prompt box, and the star in that box (or a normal
+    queue) rewrites it into the official H3 prompt with the selected API
+    service/model and Prompt Guide.
+    """
+
+    CATEGORY = "FeiHou Easy H3"
+    FUNCTION = "enhance"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("enhanced_prompt",)
+    DESCRIPTION = (
+        "Enhance a raw prompt into an official MiniMax H3 prompt with the configured API service/model and Prompt Guide. "
+        "Connect 1-9 images and 1-3 videos to the node inputs; click the star in the prompt box to enhance in place, "
+        "or queue the node to enhance with the connected reference media."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        prompt_schemes, default_prompt_scheme = _prompt_optimizer_scheme_choices()
+        prompt_providers = _prompt_optimizer_provider_choices()
+        prompt_provider_values = prompt_providers if "" in prompt_providers else ["", *prompt_providers]
+        optional = {"prompt_optimizer_applied": ("BOOLEAN", {"default": False, "hidden": True})}
+        for index in range(1, MAX_IMAGES + 1):
+            optional[f"image_{index}"] = ("IMAGE", {"forceInput": True})
+        for index in range(1, MAX_VIDEOS + 1):
+            # Reference video sockets accept the native VIDEO payload as well as
+            # a plain IMAGE frame batch, matching the loaders users already run.
+            optional[f"video_{index}"] = (_ANY_TYPE, {"forceInput": True})
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": ""}),
+                "mode": ([MODE_IMAGE, MODE_REFERENCE], {"default": MODE_REFERENCE}),
+                "seconds": ("FLOAT", {"default": 10.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
+                "prompt_optimizer_provider": (prompt_provider_values, {"default": prompt_providers[0]}),
+                "prompt_optimizer_scene_guide": (prompt_schemes, {"default": default_prompt_scheme}),
+            },
+            "optional": optional,
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, prompt_optimizer_provider, prompt_optimizer_scene_guide):
+        """Accept saved dynamic optimizer selections that settings no longer list."""
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # The backend reads mutable external service configuration, so an
+        # enhancement that will run must never be served from cache.
+        if not _as_bool(kwargs.get("prompt_optimizer_applied", False)):
+            return float("nan")
+        digest = hashlib.sha256(b"creazy-h3-prompt-enhancer-v1")
+        for name in ("prompt", "mode", "seconds", "prompt_optimizer_provider", "prompt_optimizer_scene_guide"):
+            digest.update(str(kwargs.get(name, "")).encode("utf-8"))
+            digest.update(b"\x00")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _connected_media(kwargs: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
+        images = [kwargs.get(f"image_{index}") for index in range(1, MAX_IMAGES + 1)]
+        videos = [kwargs.get(f"video_{index}") for index in range(1, MAX_VIDEOS + 1)]
+        return [item for item in images if item is not None], [item for item in videos if item is not None]
+
+    def enhance(
+        self,
+        prompt,
+        mode,
+        seconds,
+        prompt_optimizer_provider,
+        prompt_optimizer_scene_guide,
+        prompt_optimizer_applied=False,
+        **kwargs,
+    ):
+        text = str(prompt or "")
+        # The star button in the prompt box writes its result back into that
+        # box; an applied result is passed through unchanged so a queue never
+        # rewrites what the user already reviewed or edited.
+        if _as_bool(prompt_optimizer_applied):
+            return (_strip_prompt_fence(text),)
+        if not text.strip():
+            raise ValueError("Prompt cannot be empty")
+
+        images, videos = self._connected_media(kwargs)
+        inline_media: list[dict[str, Any]] = [{"type": "image", "value": item} for item in images]
+        inline_media += [{"type": "video", "value": item} for item in videos]
+        try:
+            text, _provider_id, _model = _run_configured_prompt_optimizer(
+                text,
+                str(mode or MODE_REFERENCE),
+                float(seconds),
+                str(prompt_optimizer_provider or ""),
+                str(prompt_optimizer_scene_guide or "none"),
+                {"image": len(images), "video": len(videos), "audio": 0},
+                None,
+                None,
+                REF_IMAGE_DEFAULT,
+                inline_media=inline_media,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Creazy H3 prompt enhancement failed: {exc}") from exc
+        return (_strip_prompt_fence(text),)
 
 
 def _is_loopback_web_request(request: Any) -> bool:
@@ -3642,6 +3836,7 @@ class FeiHouEasyH3Resolution:
 
 
 NODE_CLASS_MAPPINGS = {
+    "CreazyH3PromptEnhancer": CreazyH3PromptEnhancer,
     "FeiHouEasyH3Resolution": FeiHouEasyH3Resolution,
     "FeiHouEasyH3LoraStack": FeiHouEasyH3LoraStack,
     "FeiHouEasyH3Loader": FeiHouEasyH3Loader,
